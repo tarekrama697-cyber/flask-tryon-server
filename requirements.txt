@@ -1,0 +1,5 @@
+flask
+requests
+flet
+stone
+google-genai
