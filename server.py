@@ -1,105 +1,153 @@
-import time
-import base64
-import os
 import requests
-from flask import Flask, request, jsonify
+import flet as ft
+import os
 import logging
+from custom_snack_bar import ThemedSnackBar
+from utils.helpers import get_base64_data
 
-app = Flask(__name__)
+API_SERVER_URL = os.environ.get(
+    "TRYON_API_URL", "http://127.0.0.1:5001/try-on")
 
-# إعداد الـ Logging
-logging.basicConfig(level=logging.INFO)
+# متغيرات عامة
+person_file_path = None
+clothe_file_path = None
+current_pick_type = 0  # 1: شخص, 2: ملابس
+image_file_picker = None
 
-# لازم يكون موجود في Environment
-LIGHTX_API_KEY = os.environ["550d0313b4314537bc60c5655bd5115c_679d7237f8ae40fcbb018e0dae2f7147_andoraitools"]
-
-UPLOAD_URL = "https://api.lightxeditor.com/external/api/v2/uploadImageUrl"
-TRYON_URL = "https://api.lightxeditor.com/external/api/v2/aivirtualtryon"
-STATUS_URL = "https://api.lightxeditor.com/external/api/v2/order-status"
-
-
-def upload_image(file_base64, mime_type):
-    headers = {"Content-Type": "application/json", "x-api-key": LIGHTX_API_KEY}
-
-    if file_base64.startswith("data:"):
-        file_base64 = file_base64.split(",")[1]
-
-    raw_bytes = base64.b64decode(file_base64)
-    size_bytes = len(raw_bytes)
-
-    data = {
-        "uploadType": "imageUrl",
-        "size": size_bytes,
-        "contentType": mime_type
-    }
-    resp = requests.post(UPLOAD_URL, headers=headers, json=data)
-    resp.raise_for_status()
-    resp_json = resp.json()
-
-    upload_link = resp_json["body"]["uploadImage"]
-    image_url = resp_json["body"]["imageUrl"]
-
-    put_headers = {
-        "Content-Type": mime_type,
-        "Content-Length": str(size_bytes)
-    }
-    put_resp = requests.put(upload_link, headers=put_headers, data=raw_bytes)
-    put_resp.raise_for_status()
-
-    return image_url
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 
 
-@app.route("/try-on", methods=["POST"])
-def try_on():
+def try_on_process(e, page, loader_overlay, loader_ring,
+                   person_file_path, clothe_file_path,
+                   result_img_display, result_card,
+                   result_container, reset_button,
+                   download_button, action_row, input_controls):
+    if not person_file_path or not clothe_file_path:
+        page.open(ThemedSnackBar(
+            display_text="الرجاء اختيار صورة الشخص والملابس أولاً.",
+            message_type=ThemedSnackBar.TYPE_ERROR,
+            duration_seconds=3))
+        return
+
+    def show_loader():
+        loader_overlay.visible = True
+        loader_ring.visible = True
+        page.update()
+
+    def hide_loader():
+        loader_overlay.visible = False
+        loader_ring.visible = False
+        page.update()
+
+    page.run_thread(show_loader)
+
     try:
-        data = request.get_json()
+        person_data = get_base64_data(person_file_path)
+        clothe_data = get_base64_data(clothe_file_path)
 
-        person_b64 = data.get("person_image")
-        person_mime = data.get("person_mime_type")
-        cloth_b64 = data.get("clothe_image")
-        cloth_mime = data.get("clothe_mime_type")
+        if not person_data or not clothe_data:
+            raise Exception("فشل في ترميز الصور إلى Base64.")
 
-        person_url = upload_image(person_b64, person_mime)
-        cloth_url = upload_image(cloth_b64, cloth_mime)
+        response = requests.post(
+            API_SERVER_URL,
+            json={
+                "person_image": person_data["base64"],
+                "person_mime_type": person_data["mime_type"],
+                "clothe_image": clothe_data["base64"],
+                "clothe_mime_type": clothe_data["mime_type"],
+            },
+            timeout=30
+        )
 
-        headers = {"Content-Type": "application/json",
-                   "x-api-key": LIGHTX_API_KEY}
-        payload = {
-            "imageUrl": person_url,
-            "outfitImageUrl": cloth_url,
-            "segmentationType": 2
-        }
+        response.raise_for_status()
+        result_data = response.json()
 
-        resp = requests.post(TRYON_URL, headers=headers, json=payload)
-        resp.raise_for_status()
-        resp_json = resp.json()
-        order_id = resp_json["body"]["orderId"]
+        if result_data.get("status") == "success":
+            result_base64 = result_data.get("result_image_base64")
 
-        for i in range(10):
-            status_resp = requests.post(
-                STATUS_URL, headers=headers, json={"orderId": order_id})
-            status_json = status_resp.json()
-            body = status_json.get("body")
+            if result_base64:
+                def show_result():
+                    result_img_display.src_base64 = result_base64
+                    result_img_display.visible = True
+                    result_card.visible = True
+                    result_container.visible = True
+                    reset_button.visible = True
+                    download_button.visible = True
+                    action_row.visible = True
+                    input_controls.visible = False
+                    page.open(ThemedSnackBar(
+                        display_text="تمت التجربة بنجاح وعرض النتيجة!",
+                        message_type=ThemedSnackBar.TYPE_SUCCESS,
+                        duration_seconds=3))
+                    page.update()
 
-            if body and body.get("status") == "active" and "output" in body:
-                output_url = body["output"]
-                img_data = requests.get(output_url).content
-                result_b64 = base64.b64encode(img_data).decode("utf-8")
-                return jsonify({"status": "success", "result_image_base64": result_b64})
+                page.run_thread(show_result)
+            else:
+                raise Exception("الخادم لم يرجع صورة نتيجة صحيحة.")
+        else:
+            error_msg = result_data.get("error", "خطأ غير معروف من الخادم.")
+            page.run_thread(lambda: page.open(ThemedSnackBar(
+                display_text=f"فشل التجربة: {error_msg}",
+                message_type=ThemedSnackBar.TYPE_ERROR,
+                duration_seconds=5)))
 
-            elif status_json.get("status") == "FAIL":
-                error_msg = status_json.get(
-                    "description", "LightX API failed to process the request.")
-                return jsonify({"status": "error", "error": error_msg}), 500
+    except requests.exceptions.RequestException as req_ex:
+        error_msg = f"خطأ في الاتصال: تأكد من تشغيل الخادم على {API_SERVER_URL}. ({req_ex})"
+        logging.error(error_msg)
+        page.run_thread(lambda: page.open(ThemedSnackBar(
+            display_text=error_msg,
+            message_type=ThemedSnackBar.TYPE_ERROR,
+            duration_seconds=7)))
 
-            time.sleep(3)
+    except Exception as ex:
+        logging.exception("Unexpected error")
+        error_msg = f"حدث خطأ غير متوقع: {ex}"
+        page.run_thread(lambda: page.open(ThemedSnackBar(
+            display_text=error_msg,
+            message_type=ThemedSnackBar.TYPE_ERROR,
+            duration_seconds=5)))
 
-        return jsonify({"status": "error", "error": "Timeout waiting for LightX result"}), 500
-
-    except Exception as e:
-        logging.error("Exception occurred: %s", str(e))
-        return jsonify({"status": "error", "error": str(e)}), 500
+    finally:
+        page.run_thread(hide_loader)
 
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001)
+def pick_result(e: ft.FilePickerResultEvent, page,
+                person_img_preview, clothe_img_preview,
+                person_card, clothe_card, try_on_button):
+    global current_pick_type, person_file_path, clothe_file_path
+    if e.files and e.files[0]:
+        file_path = e.files[0].path
+        if current_pick_type == 1:
+            person_file_path = file_path
+            person_img_preview.src = file_path
+            person_card.visible = True
+            person_img_preview.visible = True
+        elif current_pick_type == 2:
+            clothe_file_path = file_path
+            clothe_img_preview.src = file_path
+            clothe_card.visible = True
+            clothe_img_preview.visible = True
+        page.update()
+        if person_file_path and clothe_file_path:
+            try_on_button.visible = True
+            page.update()
+    current_pick_type = 0
+
+
+def pick_person_click(e):
+    global current_pick_type, image_file_picker
+    current_pick_type = 1
+    image_file_picker.pick_files(
+        allow_multiple=False, file_type=ft.FilePickerFileType.IMAGE
+    )
+
+
+def pick_clothe_click(e):
+    global current_pick_type, image_file_picker
+    current_pick_type = 2
+    image_file_picker.pick_files(
+        allow_multiple=False, file_type=ft.FilePickerFileType.IMAGE
+    )
